@@ -1,0 +1,75 @@
+name: Publish to MCP Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Yayınlanacak sürüm (ör. 1.0.1). Boşsa server.json'daki sürüm; aynı sürüm ikinci kez yayınlanamaz."
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-registry-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check domain proof (solk.app/.well-known/mcp-registry-auth)
+        run: |
+          set -e
+          PROOF="$(curl -fsS https://solk.app/.well-known/mcp-registry-auth)"
+          echo "$PROOF"
+          echo "$PROOF" | grep -q '^v=MCPv1; k=ed25519; p=' || { echo "::error::Doğrulama dosyası yok/hatalı. Sunucuda bash /root/mcp_anahtar_kur.sh çalıştırın."; exit 1; }
+
+      - name: Set version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -e
+          V="$INPUT_VERSION"
+          if [ -z "$V" ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF#refs/tags/v}"; fi
+          if [ -n "$V" ]; then
+            jq --arg v "$V" '.version = $v' server.json > server.tmp && mv server.tmp server.json
+          fi
+          jq . server.json
+          DESC_LEN=$(jq -r '.description | length' server.json)
+          [ "$DESC_LEN" -le 100 ] || { echo "::error::description 100 karakteri aşıyor ($DESC_LEN)"; exit 1; }
+          [ "$(jq -r .name server.json)" = "app.solk/solk" ] || { echo "::error::name app.solk/solk olmalı"; exit 1; }
+
+      - name: Check remote endpoint (expects 401 + WWW-Authenticate)
+        run: |
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST https://mcp.solk.app/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}')
+          echo "https://mcp.solk.app/mcp -> HTTP $CODE"
+          [ "$CODE" = "401" ] || [ "$CODE" = "200" ] || { echo "::error::Uzak MCP adresi beklenmeyen yanıt verdi ($CODE)"; exit 1; }
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher --help > /dev/null
+
+      - name: Authenticate (HTTP, solk.app)
+        env:
+          MCP_PRIVATE_KEY: ${{ secrets.MCP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$MCP_PRIVATE_KEY" ]; then echo "::error::MCP_PRIVATE_KEY gizli değeri tanımlı değil"; exit 1; fi
+          ./mcp-publisher login http --domain solk.app --private-key "$MCP_PRIVATE_KEY"
+
+      - name: Publish
+        run: ./mcp-publisher publish
+
+      - name: Verify listing
+        run: |
+          sleep 5
+          curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=app.solk" | jq '.servers[]? | {name: (.server.name // .name), version: (.server.version // .version)}' || true
